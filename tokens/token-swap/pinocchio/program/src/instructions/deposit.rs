@@ -1,0 +1,282 @@
+//! Deposits a pair of tokens and mints the corresponding LP tokens.
+//! The pool configuration signs as the pool's token authority.
+use pinocchio::{
+    cpi::{Seed, Signer},
+    error::ProgramError,
+    AccountView, Address, ProgramResult,
+};
+use pinocchio_associated_token_account::instructions::CreateIdempotent;
+use pinocchio_token::{
+    instructions::{MintTo, Transfer},
+    state::{Account, Mint},
+};
+
+use crate::{AmmConfig, Pool, ID};
+
+pub const MINIMUM_LIQUIDITY: u64 = 100;
+
+pub struct DepositLiquidityAccounts<'a> {
+    pub amm: &'a AccountView,
+    pub pool_config: &'a AccountView,
+    pub depositor: &'a AccountView,
+    pub mint_lp: &'a mut AccountView,
+    pub pool_ata_a: &'a mut AccountView,
+    pub pool_ata_b: &'a mut AccountView,
+    pub depositor_ata_lp: &'a mut AccountView,
+    pub depositor_ata_a: &'a mut AccountView,
+    pub depositor_ata_b: &'a mut AccountView,
+    pub payer: &'a mut AccountView,
+    pub token_program: &'a AccountView,
+    pub associated_token_program: &'a AccountView,
+    pub system_program: &'a AccountView,
+}
+
+impl<'a> TryFrom<&'a mut [AccountView]> for DepositLiquidityAccounts<'a> {
+    type Error = ProgramError;
+
+    fn try_from(accounts: &'a mut [AccountView]) -> Result<Self, Self::Error> {
+        let [amm, pool_config, depositor, mint_lp, pool_ata_a, pool_ata_b, depositor_ata_lp, depositor_ata_a, depositor_ata_b, payer, token_program, associated_token_program, system_program] =
+            accounts
+        else {
+            return Err(ProgramError::NotEnoughAccountKeys);
+        };
+
+        if !depositor.is_signer() || !payer.is_signer() {
+            return Err(ProgramError::MissingRequiredSignature);
+        }
+
+        if !mint_lp.is_writable()
+            || !pool_ata_a.is_writable()
+            || !pool_ata_b.is_writable()
+            || !depositor_ata_lp.is_writable()
+            || !depositor_ata_a.is_writable()
+            || !depositor_ata_b.is_writable()
+            || !payer.is_writable()
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        if token_program.address() != &pinocchio_token::ID
+            || associated_token_program.address() != &pinocchio_associated_token_account::ID
+            || system_program.address() != &pinocchio_system::ID
+        {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        let (pool_amm, pool_mint_a, pool_mint_b, pool_bump, mint_lp_bump) = {
+            let pool = Pool::load_pool(pool_config)?;
+            (*pool.get_amm(), *pool.get_mint_a(), *pool.get_mint_b(), pool.get_bump(), pool.get_mint_lp_bump())
+        };
+
+        let expected_pool_config = Address::derive_address(
+            &[pool_amm.as_ref(), pool_mint_a.as_ref(), pool_mint_b.as_ref()],
+            Some(pool_bump[0]),
+            &ID,
+        );
+
+        if pool_config.address() != &expected_pool_config {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        // Validate AMM config
+        if amm.address() != &pool_amm {
+            return Err(ProgramError::InvalidAccountData);
+        }
+
+        let amm_config = AmmConfig::load_amm(amm)?;
+
+        if amm_config.get_paused() != 0 {
+            return Err(ProgramError::InvalidArgument);
+        }
+
+        // Validate LP mint
+        let expected_mint_lp = Address::derive_address(
+            &[pool_amm.as_ref(), pool_mint_a.as_ref(), pool_mint_b.as_ref(), b"liquidity"],
+            Some(mint_lp_bump[0]),
+            &ID,
+        );
+
+        if mint_lp.address() != &expected_mint_lp {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        // Validate pool ATAs
+        let (expected_pool_ata_a, _) = Address::derive_program_address(
+            &[pool_config.address().as_ref(), pinocchio_token::ID.as_ref(), pool_mint_a.as_ref()],
+            &pinocchio_associated_token_account::ID,
+        )
+        .ok_or(ProgramError::InvalidSeeds)?;
+
+        let (expected_pool_ata_b, _) = Address::derive_program_address(
+            &[pool_config.address().as_ref(), pinocchio_token::ID.as_ref(), pool_mint_b.as_ref()],
+            &pinocchio_associated_token_account::ID,
+        )
+        .ok_or(ProgramError::InvalidSeeds)?;
+
+        if pool_ata_a.address() != &expected_pool_ata_a || pool_ata_b.address() != &expected_pool_ata_b {
+            return Err(ProgramError::InvalidSeeds);
+        }
+
+        {
+            let depositor_a = Account::from_account_view(depositor_ata_a)?;
+            let depositor_b = Account::from_account_view(depositor_ata_b)?;
+
+            if depositor_a.mint() != &pool_mint_a
+                || depositor_b.mint() != &pool_mint_b
+                || depositor_a.owner() != depositor.address()
+                || depositor_b.owner() != depositor.address()
+            {
+                return Err(ProgramError::InvalidAccountData);
+            }
+        }
+
+        Ok(Self {
+            amm,
+            pool_config,
+            depositor,
+            mint_lp,
+            pool_ata_a,
+            pool_ata_b,
+            depositor_ata_lp,
+            depositor_ata_a,
+            depositor_ata_b,
+            payer,
+            token_program,
+            associated_token_program,
+            system_program,
+        })
+    }
+}
+
+pub struct DepositLiquidityInstructionData {
+    pub amount_a: u64,
+    pub amount_b: u64,
+}
+
+impl TryFrom<&[u8]> for DepositLiquidityInstructionData {
+    type Error = ProgramError;
+
+    fn try_from(data: &[u8]) -> Result<Self, Self::Error> {
+        if data.len() != 16 {
+            return Err(ProgramError::InvalidInstructionData);
+        }
+
+        let amount_a = u64::from_le_bytes(data[..8].try_into().map_err(|_| ProgramError::InvalidInstructionData)?);
+
+        let amount_b = u64::from_le_bytes(data[8..].try_into().map_err(|_| ProgramError::InvalidInstructionData)?);
+
+        Ok(Self { amount_a, amount_b })
+    }
+}
+
+pub struct DepositLiquidity<'a> {
+    pub accounts: DepositLiquidityAccounts<'a>,
+    pub instruction_data: DepositLiquidityInstructionData,
+}
+
+impl<'a> TryFrom<(&'a mut [AccountView], &[u8])> for DepositLiquidity<'a> {
+    type Error = ProgramError;
+
+    fn try_from((accounts, data): (&'a mut [AccountView], &[u8])) -> Result<Self, Self::Error> {
+        let accounts = DepositLiquidityAccounts::try_from(accounts)?;
+        let instruction_data = DepositLiquidityInstructionData::try_from(data)?;
+
+        Ok(Self { accounts, instruction_data })
+    }
+}
+
+impl<'a> DepositLiquidity<'a> {
+    pub const DISCRIMINATOR: &'a u8 = &2;
+
+    pub fn process(&mut self) -> ProgramResult {
+        // Load token balances and LP supply
+        let (depositor_balance_a, depositor_balance_b, pool_balance_a, pool_balance_b, mint_lp_supply) = {
+            let depositor_ata_a = Account::from_account_view(self.accounts.depositor_ata_a)?;
+            let depositor_ata_b = Account::from_account_view(self.accounts.depositor_ata_b)?;
+            let pool_ata_a = Account::from_account_view(self.accounts.pool_ata_a)?;
+            let pool_ata_b = Account::from_account_view(self.accounts.pool_ata_b)?;
+            let mint_lp = Mint::from_account_view(self.accounts.mint_lp)?;
+
+            (
+                depositor_ata_a.amount(),
+                depositor_ata_b.amount(),
+                pool_ata_a.amount(),
+                pool_ata_b.amount(),
+                mint_lp.supply(),
+            )
+        };
+
+        // Limit deposits to available balances
+        let mut amount_a = self.instruction_data.amount_a.min(depositor_balance_a);
+        let mut amount_b = self.instruction_data.amount_b.min(depositor_balance_b);
+        let pool_creation = pool_balance_a == 0 && pool_balance_b == 0;
+
+        // Preserve the pool ratio
+        if !pool_creation {
+            let amount_b_required = ((amount_a as u128) * (pool_balance_b as u128))
+                .checked_div(pool_balance_a as u128)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+
+            if amount_b_required <= amount_b as u128 {
+                amount_b = amount_b_required as u64;
+            } else {
+                amount_a = ((amount_b as u128) * (pool_balance_a as u128))
+                    .checked_div(pool_balance_b as u128)
+                    .ok_or(ProgramError::ArithmeticOverflow)? as u64;
+            }
+        }
+
+        // Calculate LP tokens
+        let liquidity = if pool_creation {
+            let initial_liquidity = u64::try_from(((amount_a as u128) * (amount_b as u128)).isqrt())
+                .map_err(|_| ProgramError::ArithmeticOverflow)?;
+
+            initial_liquidity.checked_sub(MINIMUM_LIQUIDITY).ok_or(ProgramError::InvalidArgument)?
+        } else {
+            let total_liquidity = mint_lp_supply as u128 + MINIMUM_LIQUIDITY as u128;
+            let liquidity_a = ((amount_a as u128) * total_liquidity)
+                .checked_div(pool_balance_a as u128)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+            let liquidity_b = ((amount_b as u128) * total_liquidity)
+                .checked_div(pool_balance_b as u128)
+                .ok_or(ProgramError::ArithmeticOverflow)?;
+
+            u64::try_from(liquidity_a.min(liquidity_b)).map_err(|_| ProgramError::ArithmeticOverflow)?
+        };
+
+        // Initialize depositor LP ATA
+        CreateIdempotent {
+            funding_account: self.accounts.payer,
+            account: self.accounts.depositor_ata_lp,
+            wallet: self.accounts.depositor,
+            mint: self.accounts.mint_lp,
+            system_program: self.accounts.system_program,
+            token_program: self.accounts.token_program,
+        }
+        .invoke()?;
+
+        // Transfer tokens to the pool
+        Transfer::new(self.accounts.depositor_ata_a, self.accounts.pool_ata_a, self.accounts.depositor, amount_a)
+            .invoke()?;
+
+        Transfer::new(self.accounts.depositor_ata_b, self.accounts.pool_ata_b, self.accounts.depositor, amount_b)
+            .invoke()?;
+
+        // Initialize seeds for signing
+        let (pool_amm, pool_mint_a, pool_mint_b, pool_bump) = {
+            let pool = Pool::load_pool(self.accounts.pool_config)?;
+            (*pool.get_amm(), *pool.get_mint_a(), *pool.get_mint_b(), pool.get_bump())
+        };
+        let pool_seeds = [
+            Seed::from(pool_amm.as_ref()),
+            Seed::from(pool_mint_a.as_ref()),
+            Seed::from(pool_mint_b.as_ref()),
+            Seed::from(&pool_bump),
+        ];
+        let pool_signer = Signer::from(&pool_seeds);
+
+        // Mint LP tokens
+        MintTo::new(self.accounts.mint_lp, self.accounts.depositor_ata_lp, self.accounts.pool_config, liquidity)
+            .invoke_signed(&[pool_signer])
+    }
+}
